@@ -4,11 +4,10 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    process::{Child, Command},
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use log::{debug, info, warn};
 
 use crate::{
@@ -18,6 +17,11 @@ use crate::{
 
 /// Exit code of the ramline process when the tree was killed by the limiter.
 pub const EXIT_CODE_KILLED: u8 = 3;
+
+/// How long to keep collecting events after the tree appears empty. ETW
+/// delivers events up to ~1 s late (its flush timer has 1 s granularity), so
+/// a late Spawned can arrive after the last Exited; cancelled by any Spawned.
+const GRACE_PERIOD: Duration = Duration::from_millis(1200);
 
 /// What to monitor.
 pub enum Target {
@@ -32,10 +36,6 @@ pub struct Engine<'a> {
     target: Target,
     interval: Duration,
     max_rss: Option<u64>,
-    /// Ticks to wait after the tree looks empty before finishing. An Exited
-    /// event for the root can arrive before the Spawned events of its last
-    /// children, so late events are still collected during the grace window.
-    grace_ticks: u32,
 }
 
 impl<'a> Engine<'a> {
@@ -50,21 +50,16 @@ impl<'a> Engine<'a> {
             target,
             interval,
             max_rss,
-            grace_ticks: 2,
         }
     }
 
     pub fn run(self) -> Result<(Report, u8)> {
-        let mut child: Option<Child> = None;
+        // Validate monitoring preconditions (elevation, event session)
+        // before spawning: a failure here must not leave an orphaned child.
+        self.backend.preflight()?;
         let root = match &self.target {
             Target::Spawn(argv) => {
-                let (program, rest) = argv.split_first().context("empty command")?;
-                let spawned = Command::new(program)
-                    .args(rest)
-                    .spawn()
-                    .with_context(|| format!("failed to spawn `{program}`"))?;
-                let pid = spawned.id();
-                child = Some(spawned);
+                let pid = self.backend.spawn_root(argv, self.max_rss)?;
                 info!("spawned `{}` (pid {pid})", argv.join(" "));
                 RootInfo {
                     pid,
@@ -73,6 +68,12 @@ impl<'a> Engine<'a> {
             },
             Target::Attach(pid) => {
                 info!("attaching to pid {pid}");
+                if self.max_rss.is_some() {
+                    warn!(
+                        "attach mode: no OS-enforced job limit (a running foreign tree cannot be \
+                         reassigned); the software limiter stays active"
+                    );
+                }
                 RootInfo { pid: *pid, ppid: 0 }
             },
         };
@@ -87,7 +88,8 @@ impl<'a> Engine<'a> {
         let mut totals: Vec<TotalSample> = Vec::new();
         let mut peak_rss = 0u64;
         let mut peak_private = 0u64;
-        let mut grace: Option<u32> = None;
+        let mut grace_since: Option<Instant> = None;
+        let mut root_exit_code: Option<i32> = None;
 
         let start = Instant::now();
         let mut next_tick = start + self.interval;
@@ -108,15 +110,28 @@ impl<'a> Engine<'a> {
                         ppid,
                         name,
                         exe,
+                        // Tree filtering and the PID-reuse guard happen inside
+                        // the backend; the engine trusts the event. The
+                        // create time is kept on the event for diagnostics.
+                        create_time,
                     } => {
-                        debug!("spawned: {name} (pid {pid}, ppid {ppid})");
+                        debug!(
+                            "spawned: {name} (pid {pid}, ppid {ppid}, create_time {create_time:?})"
+                        );
                         registry.on_spawned(pid, ppid, name, exe, t);
                         // Late spawn: the tree is alive again, cancel the grace window.
-                        grace = None;
+                        grace_since = None;
                     },
-                    ProcessEvent::Exited { pid } => {
+                    ProcessEvent::Exited {
+                        pid,
+                        exit_code,
+                        commit_peak_bytes,
+                    } => {
                         debug!("exited: pid {pid}");
-                        registry.on_exited(pid, t);
+                        registry.on_exited(pid, t, commit_peak_bytes);
+                        if pid == root.pid {
+                            root_exit_code = exit_code;
+                        }
                     },
                 }
             }
@@ -143,26 +158,24 @@ impl<'a> Engine<'a> {
                 });
             }
 
-            if registry.root_exited() && alive == 0 {
-                grace = match grace {
-                    None => Some(0),
-                    Some(n) if n + 1 >= self.grace_ticks => break None,
-                    Some(n) => Some(n + 1),
-                };
+            if registry.root_exited()
+                && alive == 0
+                && grace_elapsed(&mut grace_since, Instant::now())
+            {
+                break None;
             }
             next_tick += self.interval;
         };
 
         let duration_ms = millis(start.elapsed());
+        let job_peak = self.backend.job_peak_memory_bytes();
         let (outcome, exit_code) = if let Some(outcome) = killed {
             (outcome, EXIT_CODE_KILLED)
         } else {
-            let code = match &mut child {
-                Some(c) => c.wait().ok().and_then(|s| s.code()),
-                None => self.backend.exit_code(root.pid),
-            };
-            let code_u8 = code.map_or(1, |c| u8::try_from(c.clamp(0, 255)).unwrap_or(255));
-            (Outcome::Exited { code }, code_u8)
+            // Prefer the ETW event's exit code: a handle re-opened by pid
+            // may resolve to a recycled process.
+            let code = root_exit_code.or_else(|| self.backend.exit_code(root.pid));
+            classify_natural_end(job_peak, self.max_rss, duration_ms, peak_rss, code)
         };
 
         let report = Report {
@@ -175,6 +188,7 @@ impl<'a> Engine<'a> {
                 peak_total_rss_bytes: peak_rss,
                 peak_total_private_bytes: peak_private,
                 duration_ms,
+                job_peak_memory_bytes: job_peak,
             },
         };
         Ok((report, exit_code))
@@ -184,6 +198,57 @@ impl<'a> Engine<'a> {
 /// The limiter decision, isolated for testing.
 fn should_kill(total_rss: u64, max_rss: Option<u64>) -> bool {
     max_rss.is_some_and(|max| total_rss > max)
+}
+
+/// Advance the post-exit grace window, called on ticks where the tree is
+/// empty. The first call starts the window; returns true once it has fully
+/// elapsed.
+fn grace_elapsed(grace_since: &mut Option<Instant>, now: Instant) -> bool {
+    match *grace_since {
+        None => {
+            *grace_since = Some(now);
+            false
+        },
+        Some(t) => now.duration_since(t) >= GRACE_PERIOD,
+    }
+}
+
+/// Classify a run that ended with an empty tree and no limiter kill.
+///
+/// When the job object trips its commit limit, Windows kills the tree
+/// between two samples and the engine only observes all-dead; the job's
+/// peak commit then equals the limit (2 % of accounting lag is tolerated).
+/// A peak clearly below the limit means the tree exited on its own.
+fn classify_natural_end(
+    job_peak: Option<u64>,
+    max_rss: Option<u64>,
+    duration_ms: u64,
+    peak_rss: u64,
+    exit_code: Option<i32>,
+) -> (Outcome, u8) {
+    if let (Some(peak), Some(max)) = (job_peak, max_rss) {
+        if peak >= max - max / 50 {
+            return (
+                Outcome::Killed {
+                    reason: KillReason::OsJobLimit,
+                    t_ms: duration_ms,
+                    total_rss_at_kill: peak_rss,
+                },
+                EXIT_CODE_KILLED,
+            );
+        }
+    }
+    (Outcome::Exited { code: exit_code }, exit_code_u8(exit_code))
+}
+
+/// Map a process exit code to ramline's exit code: 0 stays 0, any nonzero
+/// code maps to a nonzero u8 (Windows failure codes are negative i32).
+fn exit_code_u8(code: Option<i32>) -> u8 {
+    match code {
+        None => 1,
+        Some(0) => 0,
+        Some(c) => u8::try_from(c).unwrap_or(255).max(1),
+    }
 }
 
 fn millis(t: Duration) -> u64 {
@@ -209,9 +274,14 @@ impl Registry {
     // pid/ppid are the domain names; similar_names does not apply here
     #[allow(clippy::similar_names)]
     fn on_spawned(&mut self, pid: u32, ppid: u32, name: String, exe: Option<PathBuf>, t_ms: u64) {
-        // Duplicate events (pid reuse within the same run) are ignored.
-        if self.index.contains_key(&pid) {
-            return;
+        if let Some(&i) = self.index.get(&pid) {
+            // Duplicate events for a live process are ignored.
+            if self.processes[i].exit_ms.is_none() {
+                return;
+            }
+            // PID reuse: the exited series keeps its samples in
+            // `processes`; the index is rebound to the fresh series below,
+            // so sampling and kill_all cover the recycled process.
         }
         self.index.insert(pid, self.processes.len());
         self.processes.push(ProcessSeries {
@@ -221,13 +291,17 @@ impl Registry {
             exe,
             spawn_ms: t_ms,
             exit_ms: None,
+            final_commit_peak_bytes: None,
             samples: Vec::new(),
         });
     }
 
-    fn on_exited(&mut self, pid: u32, t_ms: u64) {
+    fn on_exited(&mut self, pid: u32, t_ms: u64, commit_peak_bytes: Option<u64>) {
         if let Some(p) = self.get_mut(pid) {
             p.exit_ms = Some(t_ms);
+            if commit_peak_bytes.is_some() {
+                p.final_commit_peak_bytes = commit_peak_bytes;
+            }
         }
     }
 
@@ -371,7 +445,7 @@ mod tests {
         for pid in 1..=3 {
             reg.on_spawned(pid, 0, "p".to_owned(), None, 0);
         }
-        reg.on_exited(3, 50);
+        reg.on_exited(3, 50, None);
         reg.kill_all(&mut ops, 100);
         assert_eq!(ops.killed, vec![1, 2]);
         assert!(reg.processes.iter().all(|p| p.exit_ms.is_some()));
@@ -383,5 +457,90 @@ mod tests {
         assert!(!should_kill(100, None));
         assert!(!should_kill(100, Some(100)));
         assert!(should_kill(101, Some(100)));
+    }
+
+    #[test]
+    fn grace_period_must_fully_elapse() {
+        let mut since = None;
+        let t0 = Instant::now();
+        // The first empty-tree tick starts the window.
+        assert!(!grace_elapsed(&mut since, t0));
+        assert_eq!(since, Some(t0));
+        // Still within the window.
+        assert!(!grace_elapsed(&mut since, t0));
+        assert!(grace_elapsed(&mut since, t0 + GRACE_PERIOD));
+    }
+
+    #[test]
+    fn recycled_pid_gets_a_fresh_series() {
+        let mut reg = Registry::new(1);
+        let mut ops = FakeOps {
+            alive: HashSet::from([1, 2]),
+            rss: 100,
+            killed: Vec::new(),
+        };
+        reg.on_spawned(1, 0, "root".to_owned(), None, 0);
+        reg.on_spawned(2, 1, "old".to_owned(), None, 0);
+        reg.on_exited(2, 50, None);
+        // The pid is recycled; a duplicate Start for a live pid is ignored.
+        reg.on_spawned(2, 1, "new".to_owned(), None, 100);
+        reg.on_spawned(2, 1, "dup".to_owned(), None, 110);
+
+        assert_eq!(reg.processes.len(), 3);
+        let retired = &reg.processes[1];
+        assert_eq!(retired.name, "old");
+        assert_eq!(retired.exit_ms, Some(50));
+        let live = reg.get(2).unwrap();
+        assert_eq!(live.name, "new");
+        assert_eq!(live.exit_ms, None);
+
+        // Sampling and kill_all cover the recycled process.
+        let (rss, _, alive) = reg.sample_all(&mut ops, 200);
+        assert_eq!((rss, alive), (200, 2));
+        assert_eq!(reg.get(2).unwrap().samples.len(), 1);
+        reg.kill_all(&mut ops, 300);
+        assert_eq!(ops.killed, vec![1, 2]);
+    }
+
+    #[test]
+    fn clean_exit_below_job_limit_is_exited() {
+        // Peak job commit at 80 % of the limit: the job never tripped.
+        let (outcome, code) = classify_natural_end(Some(80), Some(100), 10, 90, Some(0));
+        assert_eq!(outcome, Outcome::Exited { code: Some(0) });
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn job_peak_at_limit_is_os_job_limit() {
+        // 2 % of accounting lag below the limit is tolerated.
+        for peak in [100, 99, 98] {
+            let (outcome, code) = classify_natural_end(Some(peak), Some(100), 10, 90, None);
+            assert!(
+                matches!(outcome, Outcome::Killed {
+                    reason: KillReason::OsJobLimit,
+                    ..
+                }),
+                "peak {peak} should classify as os_job_limit"
+            );
+            assert_eq!(code, EXIT_CODE_KILLED);
+        }
+        let (outcome, _) = classify_natural_end(Some(97), Some(100), 10, 90, Some(0));
+        assert!(matches!(outcome, Outcome::Exited { .. }));
+    }
+
+    #[test]
+    fn exit_code_mapping_keeps_failures_nonzero() {
+        assert_eq!(exit_code_u8(None), 1);
+        assert_eq!(exit_code_u8(Some(0)), 0);
+        assert_eq!(exit_code_u8(Some(1)), 1);
+        assert_eq!(exit_code_u8(Some(255)), 255);
+        assert_eq!(exit_code_u8(Some(256)), 255);
+        // 0xC0000005 (access violation) is a negative i32.
+        assert_eq!(exit_code_u8(Some(-1_073_741_819)), 255);
+        let (outcome, code) = classify_natural_end(None, None, 10, 0, Some(-1_073_741_819));
+        assert_eq!(outcome, Outcome::Exited {
+            code: Some(-1_073_741_819)
+        });
+        assert_ne!(code, 0);
     }
 }

@@ -12,6 +12,10 @@ const NOT_IMPLEMENTED: &str = "linux backend is not implemented yet (planned: ay
 pub struct LinuxBackend;
 
 impl EventSource for LinuxBackend {
+    fn preflight(&mut self) -> Result<()> {
+        bail!("{NOT_IMPLEMENTED}")
+    }
+
     fn start(&mut self, _root: RootInfo) -> Result<()> {
         bail!("{NOT_IMPLEMENTED}")
     }

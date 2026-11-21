@@ -8,7 +8,7 @@ use clap::Parser;
 #[command(version, about, long_about = None)]
 pub struct Cli {
     /// Sampling interval in milliseconds.
-    #[arg(short, long, default_value_t = 100)]
+    #[arg(short, long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
     pub interval: u64,
     /// Kill the whole process tree once total RSS exceeds this size
     /// (e.g. 512M, 2G, 1048576).
@@ -55,7 +55,10 @@ pub enum SizeError {
 )]
 pub fn parse_size(input: &str) -> Result<u64, SizeError> {
     let input = input.trim();
-    let split = input.find(char::is_alphabetic).unwrap_or(input.len());
+    // `e`/`E` belong to scientific-notation exponents, not to a suffix.
+    let split = input
+        .find(|c: char| c.is_alphabetic() && !matches!(c, 'e' | 'E'))
+        .unwrap_or(input.len());
     let (number, suffix) = input.split_at(split);
     let value: f64 = number
         .trim()
@@ -104,6 +107,8 @@ mod tests {
         assert_eq!(parse_size("512MB").unwrap(), 512 << 20);
         assert_eq!(parse_size("4GiB").unwrap(), 4 << 30);
         assert_eq!(parse_size("100B").unwrap(), 100);
+        assert_eq!(parse_size("1e5").unwrap(), 100_000);
+        assert_eq!(parse_size("2e3K").unwrap(), 2000 << 10);
     }
 
     #[test]
@@ -121,10 +126,7 @@ mod tests {
             parse_size("10X"),
             Err(SizeError::UnknownSuffix(_))
         ));
-        assert!(matches!(
-            parse_size("1e300"),
-            Err(SizeError::UnknownSuffix(_))
-        ));
+        assert!(matches!(parse_size("1e300"), Err(SizeError::OutOfRange(_))));
         assert!(matches!(parse_size("-5"), Err(SizeError::OutOfRange(_))));
         assert!(matches!(
             parse_size("9999999999999999999999"),

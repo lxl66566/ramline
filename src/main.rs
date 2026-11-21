@@ -2,6 +2,8 @@
 
 mod cli;
 mod engine;
+#[cfg(all(test, windows, feature = "admin-tests"))]
+mod etw_tests;
 mod model;
 mod monitor;
 mod output;
@@ -57,13 +59,18 @@ fn run(cli: &Cli) -> Result<u8> {
     )
     .run()?;
 
+    // An output failure must not mask the run's exit code.
     if let Some(path) = &cli.json {
-        output::write_json(&report, path)?;
-        info!("wrote JSON report to `{}`", path.display());
+        match output::write_json(&report, path) {
+            Ok(()) => info!("wrote JSON report to `{}`", path.display()),
+            Err(e) => log::error!("{e:#}"),
+        }
     }
     if let Some(path) = &cli.chart {
-        output::write_chart(&report, path, cli.max_memory)?;
-        info!("wrote chart to `{}`", path.display());
+        match output::write_chart(&report, path, cli.max_memory) {
+            Ok(()) => info!("wrote chart to `{}`", path.display()),
+            Err(e) => log::error!("{e:#}"),
+        }
     }
     info!(
         "peak total RSS: {} bytes, duration: {} ms",

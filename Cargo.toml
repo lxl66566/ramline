@@ -15,13 +15,19 @@ include      = ["/CHANGELOG.md", "/LICENSE-*", "/README.md", "/benches/**", "/sr
 anyhow = "1.0.104"
 clap = { version = "4.6.9", features = ["derive"] }
 crossfire = "3.1.23"
+ferrisetw2 = "2.0.0"
 log = "0.4.35"
 plotters = { version = "0.3.7", default-features = false, features = ["line_series", "svg_backend"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 spdlog-rs = { version = "0.5.3", features = ["flexible-string", "log"] }
 thiserror = "2.0.21"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Diagnostics_Debug"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Diagnostics_Debug", "Win32_Storage_FileSystem", "Win32_UI_Shell"] }
+
+[features]
+# Live ETW integration tests (src/etw_tests.rs). Creating an ETW trace
+# session requires elevation; run these tests as administrator.
+admin-tests = []
 
 [lints.clippy]
 all                     = { level = "warn", priority = -1 }
@@ -45,3 +51,6 @@ redundant_homepage = "allow"
 lto       = true
 opt-level = "s"
 strip     = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

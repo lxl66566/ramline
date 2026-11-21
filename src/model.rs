@@ -33,6 +33,10 @@ pub struct ProcessSeries {
     /// Milliseconds since monitoring start when the process exited.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_ms: Option<u64>,
+    /// Peak commit (private bytes) reported by the OS at process exit.
+    /// Only memory data point for processes too short-lived to be sampled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_commit_peak_bytes: Option<u64>,
     pub samples: Vec<Sample>,
 }
 
@@ -72,6 +76,9 @@ pub enum Outcome {
 #[serde(rename_all = "snake_case")]
 pub enum KillReason {
     MemoryLimitExceeded,
+    /// The job object's OS-enforced commit limit killed the tree before the
+    /// engine's limiter observed it (job peak commit reached the limit).
+    OsJobLimit,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +86,11 @@ pub struct Summary {
     pub peak_total_rss_bytes: u64,
     pub peak_total_private_bytes: u64,
     pub duration_ms: u64,
+    /// Peak total commit of the job object, present when a job limit was
+    /// active. Job accounting includes exited processes, so this peak can
+    /// exceed `peak_total_rss_bytes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_peak_memory_bytes: Option<u64>,
 }
 
 #[cfg(test)]
@@ -98,6 +110,7 @@ mod tests {
                     exe: Some(PathBuf::from(r"C:\Windows\System32\cmd.exe")),
                     spawn_ms: 0,
                     exit_ms: Some(900),
+                    final_commit_peak_bytes: Some(2048),
                     samples: vec![Sample {
                         t_ms: 100,
                         rss_bytes: 1024,
@@ -112,6 +125,7 @@ mod tests {
                     exe: None,
                     spawn_ms: 200,
                     exit_ms: None,
+                    final_commit_peak_bytes: None,
                     samples: vec![],
                 },
             ],
@@ -130,6 +144,7 @@ mod tests {
                 peak_total_rss_bytes: 4096,
                 peak_total_private_bytes: 2048,
                 duration_ms: 1000,
+                job_peak_memory_bytes: Some(8192),
             },
         };
         let json = serde_json::to_string_pretty(&report).unwrap();

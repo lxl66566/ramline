@@ -2,7 +2,7 @@
 
 use std::{path::PathBuf, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -18,18 +18,28 @@ pub enum ProcessEvent {
         ppid: u32,
         name: String,
         exe: Option<PathBuf>,
+        /// Raw Windows filetime of the process creation, when the source
+        /// provides it. Backends compare it against the opened handle to
+        /// reject stale events from a recycled pid.
+        create_time: Option<u64>,
     },
     /// A tracked process exited.
-    // Constructed only by real event sources (ETW/eBPF), not the placeholder.
-    #[allow(dead_code)]
-    Exited { pid: u32 },
+    Exited {
+        pid: u32,
+        exit_code: Option<i32>,
+        /// Peak commit (private bytes) of the process at exit, when the
+        /// source provides it. Only memory data point for processes too
+        /// short-lived to be sampled.
+        commit_peak_bytes: Option<u64>,
+    },
 }
 
 /// Identifies the root of the monitored process tree.
 #[derive(Debug, Clone, Copy)]
 pub struct RootInfo {
     pub pid: u32,
-    /// Parent pid; 0 when unknown (attach mode).
+    /// Parent pid; 0 when unknown (attach mode). Attach mode also relies on
+    /// the provider rundown to discover existing descendants.
     pub ppid: u32,
 }
 
@@ -39,6 +49,17 @@ pub struct RootInfo {
 /// [`RootInfo::pid`]; the engine trusts every event it receives and does not
 /// re-check tree membership.
 pub trait EventSource {
+    /// Validate that monitoring can start (privileges, event session, ...)
+    /// before any process is spawned. Called first by the engine, so an
+    /// early failure cannot leave an orphaned child behind. The default is
+    /// a no-op.
+    ///
+    /// # Errors
+    /// Returns an error if monitoring cannot start at all.
+    fn preflight(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Start producing events for the tree rooted at `root`.
     ///
     /// # Errors
@@ -59,6 +80,31 @@ pub struct MemorySample {
 
 /// Timer-driven sampling and termination of individual processes.
 pub trait ProcessOps {
+    /// Spawn the root process of the monitored tree and return its pid.
+    /// Implementations may place it under an OS-enforced memory limit
+    /// (`max_rss`); the exit code is read back via [`ProcessOps::exit_code`].
+    ///
+    /// The default spawns through std with no OS-level limiting.
+    ///
+    /// # Errors
+    /// Returns an error if the process cannot be spawned.
+    fn spawn_root(&mut self, argv: &[String], _max_rss: Option<u64>) -> Result<u32> {
+        let (program, rest) = argv.split_first().context("empty command")?;
+        let child = std::process::Command::new(program)
+            .args(rest)
+            .spawn()
+            .with_context(|| format!("failed to spawn `{program}`"))?;
+        Ok(child.id())
+    }
+
+    /// Peak commit of the OS-enforced process group (Windows job object);
+    /// `Some` only while such a group is active. Job accounting includes
+    /// processes that already exited, so this peak can exceed the sampled
+    /// peak.
+    fn job_peak_memory_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Sample memory counters of `pid`. `None` means the process is gone or
     /// cannot be sampled; the engine treats it as exited.
     fn sample(&mut self, pid: u32) -> Option<MemorySample>;

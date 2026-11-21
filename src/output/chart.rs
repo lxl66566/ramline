@@ -12,6 +12,8 @@ const MIB: f64 = 1024.0 * 1024.0;
 const MAX_PROCESS_SERIES: usize = 8;
 /// Dash segments used to draw the memory limit line.
 const LIMIT_SEGMENTS: u32 = 60;
+/// Chart titles stay on one line; longer commands are truncated.
+const MAX_TITLE_CHARS: usize = 80;
 
 #[allow(clippy::cast_precision_loss)]
 pub fn write_chart(report: &Report, path: &Path, limit_bytes: Option<u64>) -> Result<()> {
@@ -28,7 +30,7 @@ pub fn write_chart(report: &Report, path: &Path, limit_bytes: Option<u64>) -> Re
     let target = if report.command.is_empty() {
         format!("pid {}", report.root_pid)
     } else {
-        report.command.join(" ")
+        truncate_title(&report.command.join(" "))
     };
     let title = format!("ramline: {target} (peak {peak_mib:.1} MiB)");
 
@@ -88,4 +90,53 @@ pub fn write_chart(report: &Report, path: &Path, limit_bytes: Option<u64>) -> Re
         .draw()?;
     root.present()?;
     Ok(())
+}
+
+fn truncate_title(target: &str) -> String {
+    if target.chars().count() <= MAX_TITLE_CHARS {
+        return target.to_owned();
+    }
+    let mut s: String = target.chars().take(MAX_TITLE_CHARS).collect();
+    s.push_str("...");
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Outcome, Summary};
+
+    fn empty_report() -> Report {
+        Report {
+            command: Vec::new(),
+            root_pid: 1,
+            processes: Vec::new(),
+            totals: Vec::new(),
+            outcome: Outcome::Exited { code: Some(0) },
+            summary: Summary {
+                peak_total_rss_bytes: 0,
+                peak_total_private_bytes: 0,
+                duration_ms: 0,
+                job_peak_memory_bytes: None,
+            },
+        }
+    }
+
+    #[test]
+    fn writes_chart_for_empty_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chart.svg");
+        write_chart(&empty_report(), &path, Some(1024)).unwrap();
+        let svg = std::fs::read_to_string(&path).unwrap();
+        assert!(svg.contains("<svg"));
+    }
+
+    #[test]
+    fn truncates_long_titles() {
+        let long = "a".repeat(200);
+        let truncated = truncate_title(&long);
+        assert_eq!(truncated.chars().count(), MAX_TITLE_CHARS + 3);
+        assert!(truncated.ends_with("..."));
+        assert_eq!(truncate_title("short"), "short");
+    }
 }
