@@ -6,3 +6,9 @@ slow-timeout = { timeout = "60s", terminate-after = 2 }
 [[profile.default.overrides]]
 filter = 'test(etw_tests)'
 slow-timeout = { period = "60s", timeout = "120s", terminate-after = 2 }
+
+# Live eBPF tests spawn real process trees and wait out the engine grace
+# window.
+[[profile.default.overrides]]
+filter = 'test(ebpf_tests)'
+slow-timeout = { period = "60s", timeout = "120s", terminate-after = 2 }

@@ -19,7 +19,10 @@ use windows::{
 /// Created with `KILL_ON_JOB_CLOSE`: when the last handle to the job is
 /// closed (including ramline exiting or crashing), Windows terminates every
 /// process still in the job.
-pub struct Job(HANDLE);
+pub struct Job {
+    handle: HANDLE,
+    limit_bytes: u64,
+}
 
 impl Job {
     /// Create a job whose total commit charge is limited to `limit_bytes`.
@@ -52,7 +55,10 @@ impl Job {
             )
         }
         .context("SetInformationJobObject failed")?;
-        Ok(Self(handle))
+        Ok(Self {
+            handle,
+            limit_bytes,
+        })
     }
 
     /// Add a process to the job; its future descendants inherit the job.
@@ -61,8 +67,15 @@ impl Job {
     /// Returns an error if the assignment fails.
     pub fn assign(&self, process: HANDLE) -> Result<()> {
         // Safety: both handles are valid and only borrowed by the call.
-        unsafe { AssignProcessToJobObject(self.0, process) }
+        unsafe { AssignProcessToJobObject(self.handle, process) }
             .context("AssignProcessToJobObject failed")
+    }
+
+    /// Whether the job's commit limit tripped: the peak commit then reaches
+    /// the limit (2 % of accounting lag tolerated).
+    pub fn limit_tripped(&self) -> bool {
+        self.peak_memory_bytes()
+            .is_some_and(|peak| commit_limit_tripped(peak, self.limit_bytes))
     }
 
     /// Peak total commit charge of all processes ever assigned to the job,
@@ -74,7 +87,7 @@ impl Job {
         // Safety: info is a valid out buffer of the advertised size.
         unsafe {
             QueryInformationJobObject(
-                Some(self.0),
+                Some(self.handle),
                 JobObjectExtendedLimitInformation,
                 (&raw mut info).cast(),
                 size,
@@ -86,9 +99,30 @@ impl Job {
     }
 }
 
+/// A peak commit of `peak` with a job limit of `limit` means the limit
+/// tripped. Commit-based jobs trip exactly at the limit, so the false-
+/// positive band of the peak comparison is narrow.
+fn commit_limit_tripped(peak: u64, limit: u64) -> bool {
+    peak >= limit - limit / 50
+}
+
 impl Drop for Job {
     fn drop(&mut self) {
         // Safety: the job handle is owned and closed exactly once.
-        let _ = unsafe { CloseHandle(self.0) };
+        let _ = unsafe { CloseHandle(self.handle) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_limit_trip_threshold() {
+        // 2 % of accounting lag below the limit is tolerated.
+        for peak in [100, 99, 98] {
+            assert!(commit_limit_tripped(peak, 100), "peak {peak}");
+        }
+        assert!(!commit_limit_tripped(97, 100));
     }
 }

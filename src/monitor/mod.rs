@@ -6,6 +6,8 @@ use anyhow::{Context as _, Result};
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+/// Platform-pure process-tree filter shared by the backends.
+mod tree;
 #[cfg(windows)]
 pub mod windows;
 
@@ -97,12 +99,21 @@ pub trait ProcessOps {
         Ok(child.id())
     }
 
-    /// Peak commit of the OS-enforced process group (Windows job object);
-    /// `Some` only while such a group is active. Job accounting includes
-    /// processes that already exited, so this peak can exceed the sampled
-    /// peak.
+    /// Peak memory of the OS-enforced process group (Windows job object
+    /// commit, Linux cgroup usage); `Some` only while such a group is
+    /// active. OS accounting includes processes that already exited, so
+    /// this peak can exceed the sampled peak. Informational: limit
+    /// classification uses [`ProcessOps::os_limit_tripped`].
     fn job_peak_memory_bytes(&self) -> Option<u64> {
         None
+    }
+
+    /// Whether the OS-enforced memory limit actually tripped during the
+    /// run. The engine classifies a naturally-ended tree as `os_job_limit`
+    /// only when this returns true: a peak near the limit is no proof
+    /// (cgroup accounting includes reclaimable page cache).
+    fn os_limit_tripped(&self) -> bool {
+        false
     }
 
     /// Sample memory counters of `pid`. `None` means the process is gone or
@@ -130,5 +141,5 @@ pub fn default_backend() -> impl Backend {
 /// Construct the backend for the current platform.
 #[cfg(target_os = "linux")]
 pub fn default_backend() -> impl Backend {
-    linux::LinuxBackend
+    linux::LinuxBackend::new()
 }

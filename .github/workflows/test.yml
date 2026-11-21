@@ -22,10 +22,29 @@ jobs:
       - uses: kunobi-ninja/kache-action@v1
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          components: clippy, rustfmt
+          # rust-src: build.rs compiles the eBPF crate with build-std
+          components: clippy, rustfmt, rust-src
+      - name: install LLVM 23
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 23
+      - name: cache bpf-linker
+        id: bpf-linker
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: ${{ runner.os }}-bpf-linker-0.13.0-llvm-23
+      - name: install bpf-linker
+        if: steps.bpf-linker.outputs.cache-hit != 'true'
+        env:
+          LLVM_SYS_231_PREFIX: /usr/lib/llvm-23
+        run: cargo install bpf-linker --locked --version 0.13.0 --no-default-features --features llvm-23
       - name: cargo fmt
         run: cargo fmt --all --check
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: cargo test
-        run: cargo nextest run --all-features --locked --no-tests pass && cargo test --all-features --locked --doc
+        # ebpf_tests are gated behind admin-tests and require root; CI runs
+        # unprivileged, so they are filtered out here and run manually.
+        run: cargo nextest run --all-features --locked --no-tests pass -E 'not test(/^ebpf_tests::)/' && cargo test --all-features --locked --doc

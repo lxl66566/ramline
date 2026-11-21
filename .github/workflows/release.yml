@@ -16,6 +16,27 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
+      # Linux targets: build.rs compiles the eBPF crate via aya-build, which
+      # needs a nightly toolchain with rust-src and bpf-linker on PATH.
+      - name: install eBPF toolchain (Linux targets)
+        if: runner.os == 'Linux'
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 23
+      - name: cache bpf-linker
+        if: runner.os == 'Linux'
+        id: bpf-linker
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: ${{ runner.os }}-bpf-linker-0.13.0-llvm-23
+      - name: install bpf-linker
+        if: runner.os == 'Linux' && steps.bpf-linker.outputs.cache-hit != 'true'
+        env:
+          LLVM_SYS_231_PREFIX: /usr/lib/llvm-23
+        run: cargo install bpf-linker --locked --version 0.13.0 --no-default-features --features llvm-23
       - name: release rust project
         uses: lxl66566/rust-simple-release@main
         with:

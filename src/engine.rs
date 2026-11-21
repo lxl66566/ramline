@@ -175,7 +175,13 @@ impl<'a> Engine<'a> {
             // Prefer the ETW event's exit code: a handle re-opened by pid
             // may resolve to a recycled process.
             let code = root_exit_code.or_else(|| self.backend.exit_code(root.pid));
-            classify_natural_end(job_peak, self.max_rss, duration_ms, peak_rss, code)
+            classify_natural_end(
+                self.backend.os_limit_tripped(),
+                duration_ms,
+                peak_rss,
+                code,
+                matches!(self.target, Target::Attach(_)),
+            )
         };
 
         let report = Report {
@@ -215,30 +221,31 @@ fn grace_elapsed(grace_since: &mut Option<Instant>, now: Instant) -> bool {
 
 /// Classify a run that ended with an empty tree and no limiter kill.
 ///
-/// When the job object trips its commit limit, Windows kills the tree
-/// between two samples and the engine only observes all-dead; the job's
-/// peak commit then equals the limit (2 % of accounting lag is tolerated).
-/// A peak clearly below the limit means the tree exited on its own.
+/// When the OS backstop (job object / cgroup) trips, the OS kills the tree
+/// between two samples and the engine only observes all-dead; the backend
+/// reports the trip through `os_limit_tripped`.
 fn classify_natural_end(
-    job_peak: Option<u64>,
-    max_rss: Option<u64>,
+    os_limit_tripped: bool,
     duration_ms: u64,
     peak_rss: u64,
     exit_code: Option<i32>,
+    attach: bool,
 ) -> (Outcome, u8) {
-    if let (Some(peak), Some(max)) = (job_peak, max_rss) {
-        if peak >= max - max / 50 {
-            return (
-                Outcome::Killed {
-                    reason: KillReason::OsJobLimit,
-                    t_ms: duration_ms,
-                    total_rss_at_kill: peak_rss,
-                },
-                EXIT_CODE_KILLED,
-            );
-        }
+    if os_limit_tripped {
+        return (
+            Outcome::Killed {
+                reason: KillReason::OsJobLimit,
+                t_ms: duration_ms,
+                total_rss_at_kill: peak_rss,
+            },
+            EXIT_CODE_KILLED,
+        );
     }
-    (Outcome::Exited { code: exit_code }, exit_code_u8(exit_code))
+    // Attach mode cannot always recover the root's exit code (a pidfd
+    // cannot reap a non-child), so a finished tree without a code counts
+    // as success there; in spawn mode a missing code is a lost code.
+    let code = if exit_code.is_none() && attach { 0 } else { exit_code_u8(exit_code) };
+    (Outcome::Exited { code: exit_code }, code)
 }
 
 /// Map a process exit code to ramline's exit code: 0 stays 0, any nonzero
@@ -503,29 +510,35 @@ mod tests {
     }
 
     #[test]
-    fn clean_exit_below_job_limit_is_exited() {
-        // Peak job commit at 80 % of the limit: the job never tripped.
-        let (outcome, code) = classify_natural_end(Some(80), Some(100), 10, 90, Some(0));
+    fn clean_exit_is_exited() {
+        // The OS limit did not trip. On Linux a cgroup memory.peak at the
+        // limit still reaches here as `false` when no OOM kill happened:
+        // cgroup accounting includes reclaimable page cache.
+        let (outcome, code) = classify_natural_end(false, 10, 90, Some(0), false);
         assert_eq!(outcome, Outcome::Exited { code: Some(0) });
         assert_eq!(code, 0);
     }
 
     #[test]
-    fn job_peak_at_limit_is_os_job_limit() {
-        // 2 % of accounting lag below the limit is tolerated.
-        for peak in [100, 99, 98] {
-            let (outcome, code) = classify_natural_end(Some(peak), Some(100), 10, 90, None);
-            assert!(
-                matches!(outcome, Outcome::Killed {
-                    reason: KillReason::OsJobLimit,
-                    ..
-                }),
-                "peak {peak} should classify as os_job_limit"
-            );
-            assert_eq!(code, EXIT_CODE_KILLED);
-        }
-        let (outcome, _) = classify_natural_end(Some(97), Some(100), 10, 90, Some(0));
-        assert!(matches!(outcome, Outcome::Exited { .. }));
+    fn tripped_os_limit_is_os_job_limit() {
+        let (outcome, code) = classify_natural_end(true, 10, 90, None, false);
+        assert!(matches!(outcome, Outcome::Killed {
+            reason: KillReason::OsJobLimit,
+            ..
+        }));
+        assert_eq!(code, EXIT_CODE_KILLED);
+    }
+
+    #[test]
+    fn attach_without_exit_code_exits_zero() {
+        // Attach mode cannot always recover the root's exit code (Linux:
+        // a pidfd cannot reap a non-child); a finished tree without a kill
+        // counts as success. Spawn mode keeps the lost-code failure.
+        let (outcome, code) = classify_natural_end(false, 10, 0, None, true);
+        assert_eq!(outcome, Outcome::Exited { code: None });
+        assert_eq!(code, 0);
+        let (_, code) = classify_natural_end(false, 10, 0, None, false);
+        assert_eq!(code, 1);
     }
 
     #[test]
@@ -537,7 +550,7 @@ mod tests {
         assert_eq!(exit_code_u8(Some(256)), 255);
         // 0xC0000005 (access violation) is a negative i32.
         assert_eq!(exit_code_u8(Some(-1_073_741_819)), 255);
-        let (outcome, code) = classify_natural_end(None, None, 10, 0, Some(-1_073_741_819));
+        let (outcome, code) = classify_natural_end(false, 10, 0, Some(-1_073_741_819), false);
         assert_eq!(outcome, Outcome::Exited {
             code: Some(-1_073_741_819)
         });

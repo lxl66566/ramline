@@ -52,7 +52,7 @@ use windows::{
 };
 
 use self::job::Job;
-use super::{EventSource, MemorySample, ProcessEvent, ProcessOps, RootInfo};
+use super::{EventSource, MemorySample, ProcessEvent, ProcessOps, RootInfo, tree::TreeFilter};
 
 mod job;
 
@@ -87,93 +87,17 @@ enum RawEvent {
     },
 }
 
-impl RawEvent {
+impl super::tree::Event for RawEvent {
     fn pid(&self) -> u32 {
         match self {
             Self::Start { pid, .. } | Self::Stop { pid, .. } => *pid,
         }
     }
-}
 
-/// Filters raw ETW events down to the monitored tree.
-///
-/// Events for one pid arrive in order, but the Start of a child can arrive
-/// before the Start of its parent within the same flush batch. Such events
-/// are parked in `pending`, keyed by parent pid, and reconciled when the
-/// parent's Start arrives; a drained Start can itself unblock further pending
-/// events (grandchildren). Events of processes outside the tree are dropped;
-/// their pending entries are never reclaimed, which stays negligible at
-/// system-wide process churn rates.
-struct TreeFilter {
-    root: u32,
-    /// Pids belonging to the tree, including stopped ones (kept so a Stop
-    /// delivered before a child's Start in the same batch does not lose the
-    /// child; a new Start after a Stop is treated as PID reuse).
-    known: HashSet<u32>,
-    /// Tree pids for which a Stop was already emitted.
-    stopped: HashSet<u32>,
-    /// pid -> parent pid for every Start seen, known or pending.
-    parent_of: HashMap<u32, u32>,
-    /// Parent pid -> events parked until that parent joins the tree.
-    pending: HashMap<u32, Vec<RawEvent>>,
-}
-
-impl TreeFilter {
-    fn new(root: u32) -> Self {
-        Self {
-            root,
-            known: HashSet::from([root]),
-            stopped: HashSet::new(),
-            parent_of: HashMap::new(),
-            pending: HashMap::new(),
-        }
-    }
-
-    /// Feed one raw event; tree-member events are appended to `out` in order.
-    // pid/ppid are the domain names; similar_names does not apply here
-    #[allow(clippy::similar_names)]
-    fn on_event(&mut self, raw: RawEvent, out: &mut Vec<RawEvent>) {
-        match raw {
-            RawEvent::Start { pid, ppid, .. } => {
-                self.parent_of.insert(pid, ppid);
-                if self.known.contains(&ppid) || pid == self.root {
-                    self.adopt(raw, out);
-                } else {
-                    self.pending.entry(ppid).or_default().push(raw);
-                }
-            },
-            RawEvent::Stop { pid, .. } => {
-                if self.known.contains(&pid) {
-                    if self.stopped.insert(pid) {
-                        // The pid's lineage is no longer needed.
-                        self.parent_of.remove(&pid);
-                        out.push(raw);
-                    }
-                } else if let Some(&ppid) = self.parent_of.get(&pid) {
-                    // Stop for a child whose Start is still pending: park it
-                    // behind the same parent.
-                    self.pending.entry(ppid).or_default().push(raw);
-                }
-                // Stops for processes never seen starting are outside the tree.
-            },
-        }
-    }
-
-    // pid/ppid are the domain names; similar_names does not apply here
-    #[allow(clippy::similar_names)]
-    fn adopt(&mut self, raw: RawEvent, out: &mut Vec<RawEvent>) {
-        let pid = raw.pid();
-        if self.known.contains(&pid) && !self.stopped.contains(&pid) {
-            return; // duplicate Start (live event plus rundown)
-        }
-        // A Start for a pid seen as stopped means the pid was recycled.
-        self.stopped.remove(&pid);
-        self.known.insert(pid);
-        out.push(raw);
-        if let Some(parked) = self.pending.remove(&pid) {
-            for event in parked {
-                self.on_event(event, out);
-            }
+    fn parent_pid(&self) -> Option<u32> {
+        match self {
+            Self::Start { ppid, .. } => Some(*ppid),
+            Self::Stop { .. } => None,
         }
     }
 }
@@ -208,7 +132,7 @@ pub struct WindowsBackend {
     raw_rx: Rx<List<RawEvent>>,
     /// Filtered events waiting to be returned by `recv_timeout`.
     ready: VecDeque<ProcessEvent>,
-    filter: Option<TreeFilter>,
+    filter: Option<TreeFilter<RawEvent>>,
     trace: Option<EtwTrace>,
     /// Root pid and its full-access `CreateProcessW` handle (spawn mode).
     /// Kept out of `handles` so the sampler closing a dead entry cannot
@@ -463,6 +387,10 @@ impl ProcessOps for WindowsBackend {
 
     fn job_peak_memory_bytes(&self) -> Option<u64> {
         self.job.as_ref().and_then(Job::peak_memory_bytes)
+    }
+
+    fn os_limit_tripped(&self) -> bool {
+        self.job.as_ref().is_some_and(Job::limit_tripped)
     }
 
     fn sample(&mut self, pid: u32) -> Option<MemorySample> {
@@ -760,90 +688,9 @@ fn query_dos_device(letter: u8) -> Option<String> {
     Some(s.trim_end_matches('\0').to_owned())
 }
 
-// pid/ppid are the domain names; similar_names does not apply here
 #[cfg(test)]
-#[allow(clippy::similar_names)]
 mod tests {
     use super::*;
-
-    fn start(pid: u32, ppid: u32) -> RawEvent {
-        RawEvent::Start {
-            pid,
-            ppid,
-            create_time: None,
-            image: String::new(),
-        }
-    }
-
-    fn stop(pid: u32) -> RawEvent {
-        RawEvent::Stop {
-            pid,
-            exit_code: Some(0),
-            commit_peak_bytes: None,
-        }
-    }
-
-    fn pids(out: &[RawEvent]) -> Vec<u32> {
-        out.iter().map(RawEvent::pid).collect()
-    }
-
-    #[test]
-    fn drops_events_outside_the_tree() {
-        let mut filter = TreeFilter::new(1);
-        let mut out = Vec::new();
-        filter.on_event(start(2, 1), &mut out); // child of root
-        filter.on_event(start(3, 99), &mut out); // unrelated
-        filter.on_event(stop(3), &mut out); // unrelated stop
-        filter.on_event(stop(2), &mut out);
-        assert_eq!(pids(&out), vec![2, 2]);
-    }
-
-    #[test]
-    fn reconciles_child_start_arriving_before_parent_start() {
-        let mut filter = TreeFilter::new(1);
-        let mut out = Vec::new();
-        // Grandchild arrives before its parent (same flush batch reorder).
-        filter.on_event(start(3, 2), &mut out);
-        filter.on_event(stop(3), &mut out);
-        assert!(out.is_empty());
-        filter.on_event(start(2, 1), &mut out);
-        assert_eq!(pids(&out), vec![2, 3, 3]);
-    }
-
-    #[test]
-    fn dedups_rundown_and_live_starts() {
-        let mut filter = TreeFilter::new(1);
-        let mut out = Vec::new();
-        filter.on_event(start(2, 1), &mut out);
-        filter.on_event(start(2, 1), &mut out); // duplicate
-        filter.on_event(stop(2), &mut out);
-        filter.on_event(stop(2), &mut out); // duplicate
-        assert_eq!(pids(&out), vec![2, 2]);
-    }
-
-    #[test]
-    fn dedups_rundown_start_for_root_and_adopts_existing_children() {
-        // Spawn-mode rundown: the root's own Start arrives via rundown while
-        // it was already registered; pre-existing children have a known
-        // parent and are adopted.
-        let mut filter = TreeFilter::new(1);
-        let mut out = Vec::new();
-        filter.on_event(start(1, 99), &mut out); // rundown Start for root itself
-        assert!(out.is_empty());
-        filter.on_event(start(2, 1), &mut out);
-        assert_eq!(pids(&out), vec![2]);
-    }
-
-    #[test]
-    fn start_after_stop_means_pid_reuse() {
-        let mut filter = TreeFilter::new(1);
-        let mut out = Vec::new();
-        filter.on_event(start(2, 1), &mut out);
-        filter.on_event(stop(2), &mut out);
-        filter.on_event(start(2, 1), &mut out); // recycled pid
-        filter.on_event(stop(2), &mut out);
-        assert_eq!(pids(&out), vec![2, 2, 2, 2]);
-    }
 
     #[test]
     fn quotes_command_line_args_per_msvcrt_rules() {

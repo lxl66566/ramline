@@ -1,6 +1,8 @@
 //! ramline: memory monitor for a command and its spawned process tree.
 
 mod cli;
+#[cfg(all(test, target_os = "linux", feature = "admin-tests"))]
+mod ebpf_tests;
 mod engine;
 #[cfg(all(test, windows, feature = "admin-tests"))]
 mod etw_tests;
