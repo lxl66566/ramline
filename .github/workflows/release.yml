@@ -28,7 +28,7 @@ jobs:
       - name: cache bpf-linker
         if: runner.os == 'Linux'
         id: bpf-linker
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/bpf-linker
           key: ${{ runner.os }}-bpf-linker-0.13.0-llvm-23
