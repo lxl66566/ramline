@@ -37,7 +37,7 @@ Note: the test binary lands at `target/debug/build/ramline-<hash>/out/ramline-<h
 
 ### Major
 
-**M1. Silent ring-buffer event loss; no lost-event accounting** — `ramline-ebpf/src/main.rs:62` (`emit`: `let Some(mut entry) = EVENTS.reserve::<ProcEvent>(0) else { return; }`).
+**M1. Silent ring-buffer event loss; no lost-event accounting** — `crates/ramline-ebpf/src/main.rs:62` (`emit`: `let Some(mut entry) = EVENTS.reserve::<ProcEvent>(0) else { return; }`).
 When the ring is full the fork/exit event is dropped silently. A lost fork means the child never gets a `Spawned`, is never sampled and never killed — it escapes the software RSS limiter (its later exit is also dropped by the tree filter as unknown). The kernel ringbuf has no lost-record mechanism (unlike perf buffer), and userspace never checks. Two amplifiers:
 - `try_fork` emits for **every clone system-wide**, including `CLONE_THREAD` thread creation (the leader check happens in userspace, `linux.rs:447`), inflating churn far beyond process churn; at ~40 bytes/record the 256 KiB ring holds ~6.5k records.
 - The consumer is slowest exactly under load: every fork event triggers a `/proc/<pid>/status` read+parse (`is_process_leader`) on the event thread, plus a `read_link` for accepted events.

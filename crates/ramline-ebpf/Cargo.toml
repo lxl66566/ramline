@@ -1,0 +1,21 @@
+[package]
+name    = "ramline-ebpf"
+version = { workspace = true }
+edition = { workspace = true }
+publish = false
+
+# Bin name `ramline`: aya-build copies the built object to
+# $OUT_DIR/ramline of the userspace crate.
+[[bin]]
+name = "ramline"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf            = { workspace = true }
+ramline-ebpf-common = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[lints]
+workspace = true

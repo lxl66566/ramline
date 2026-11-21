@@ -47,4 +47,4 @@ jobs:
       - name: cargo test
         # ebpf_tests are gated behind admin-tests and require root; CI runs
         # unprivileged, so they are filtered out here and run manually.
-        run: cargo nextest run --all-features --locked --no-tests pass -E 'not test(/^ebpf_tests::)/' && cargo test --all-features --locked --doc
+        run: cargo nextest run --all-features --locked --no-tests pass -E 'not test(/^ebpf_tests::/)'

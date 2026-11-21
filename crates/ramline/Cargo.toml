@@ -1,0 +1,52 @@
+[package]
+name         = "ramline"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+description  = "Event-driven memory monitor for a command and its spawned process tree"
+readme       = "../../README.md"
+homepage     = { workspace = true }
+repository   = { workspace = true }
+license      = { workspace = true }
+keywords     = ["cli", "memory", "monitor", "profiler", "rss"]
+categories   = ["command-line-utilities"]
+
+[dependencies]
+anyhow     = { workspace = true }
+clap       = { workspace = true }
+crossfire  = { workspace = true }
+log        = { workspace = true }
+plotters   = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+spdlog-rs  = { workspace = true }
+thiserror  = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# Unconditional: build.rs gates the eBPF build itself on the target OS, and
+# target-gated build-dependencies would not match the host when
+# cross-checking for Windows.
+[build-dependencies]
+anyhow         = { workspace = true }
+aya-build      = { workspace = true }
+cargo_metadata = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya                 = { workspace = true }
+libc                = { workspace = true }
+ramline-ebpf-common = { workspace = true }
+tokio               = { workspace = true }
+
+[target."cfg(windows)".dependencies]
+ferrisetw2 = { workspace = true }
+windows    = { workspace = true }
+
+[features]
+# Live ETW integration tests (src/etw_tests.rs). Creating an ETW trace
+# session requires elevation; run these tests as administrator.
+admin-tests = []
+
+[lints]
+workspace = true

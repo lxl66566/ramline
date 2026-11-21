@@ -1,56 +1,53 @@
-[package]
-name         = "ramline"
+[workspace]
+resolver        = "3"
+members         = ["crates/ramline", "crates/ramline-ebpf", "crates/ramline-ebpf-common"]
+# The eBPF crate only builds for a bpf target through aya-build (build.rs).
+default-members = ["crates/ramline"]
+
+[workspace.package]
 version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.85"
-description  = "Event-driven memory monitor for a command and its spawned process tree"
 homepage     = "https://github.com/lxl66566/ramline"
 repository   = "https://github.com/lxl66566/ramline"
 license      = "MIT OR Apache-2.0"
-keywords     = ["memory", "rss", "monitor", "profiler", "cli"]
-categories   = ["command-line-utilities"]
-include      = ["/CHANGELOG.md", "/LICENSE-*", "/README.md", "/benches/**", "/src/**", "/tests/**"]
 
-[workspace]
-members         = ["ramline-ebpf", "ramline-ebpf-common"]
-# The eBPF crate only builds for a bpf target through aya-build (build.rs).
-default-members = ["."]
+[workspace.dependencies]
+anyhow              = "1.0.104"
+aya                 = "0.16.0"
+aya-build           = "0.2.1"
+aya-ebpf            = "0.3.0"
+cargo_metadata      = "0.23.0"
+clap                = { version = "4.6.9", features = ["derive"] }
+crossfire           = "3.1.23"
+ferrisetw2          = "2.0.0"
+libc                = "0.2.182"
+log                 = "0.4.35"
+plotters            = { version = "0.3.7", default-features = false, features = ["line_series", "svg_backend"] }
+ramline-ebpf-common = { path = "crates/ramline-ebpf-common", version = "0.1.0" }
+serde               = { version = "1.0.229", features = ["derive"] }
+serde_json          = "1.0.154"
+spdlog-rs           = { version = "0.5.3", features = ["flexible-string", "log"] }
+tempfile            = "3.27.0"
+thiserror           = "2.0.21"
+tokio               = { version = "1.53.3", features = ["net", "rt", "time"] }
+which               = "6.0.0"
+windows             = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_JobObjects",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+  "Win32_UI_Shell"
+] }
 
-[dependencies]
-anyhow = "1.0.104"
-clap = { version = "4.6.9", features = ["derive"] }
-crossfire = "3.1.23"
-log = "0.4.35"
-plotters = { version = "0.3.7", default-features = false, features = ["line_series", "svg_backend"] }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
-spdlog-rs = { version = "0.5.3", features = ["flexible-string", "log"] }
-thiserror = "2.0.21"
+[workspace.lints.cargo]
+# homepage is required explicitly even though it matches repository
+redundant_homepage = "allow"
 
-[target.'cfg(windows)'.dependencies]
-ferrisetw2 = "2.0.0"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Diagnostics_Debug", "Win32_Storage_FileSystem", "Win32_UI_Shell"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-aya = "0.16.0"
-libc = "0.2.182"
-ramline-ebpf-common = { version = "0.1.0", path = "ramline-ebpf-common" }
-tokio = { version = "1.53.3", features = ["rt", "net", "time"] }
-
-# Unconditional: build.rs gates the eBPF build itself on the target OS, and
-# target-gated build-dependencies would not match the host when
-# cross-checking for Windows.
-[build-dependencies]
-anyhow = "1.0.104"
-aya-build = "0.2.1"
-cargo_metadata = "0.23.0"
-
-[features]
-# Live ETW integration tests (src/etw_tests.rs). Creating an ETW trace
-# session requires elevation; run these tests as administrator.
-admin-tests = []
-
-[lints.clippy]
+[workspace.lints.clippy]
 all                     = { level = "warn", priority = -1 }
 cargo                   = { level = "warn", priority = -1 }
 doc_markdown            = "allow"
@@ -60,25 +57,18 @@ multiple_crate_versions = "allow"
 pedantic                = { level = "warn", priority = -1 }
 wildcard_imports        = "allow"
 
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code           = "allow"
 unused_qualifications = "warn"
 
-[lints.cargo]
-# homepage is required explicitly even though it matches repository
-redundant_homepage = "allow"
-
 [profile.release]
-lto       = true
 opt-level = "s"
 strip     = true
+lto       = true
 
 [profile.release.package.ramline-ebpf]
 # bpf-linker (LLVM 23) rejects the workspace's opt-level = "s".
 opt-level     = 2
 debug         = 2
-codegen-units = 1
 strip         = false
-
-[dev-dependencies]
-tempfile = "3.27.0"
+codegen-units = 1
